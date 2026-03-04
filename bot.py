@@ -65,15 +65,19 @@ SPAM_MUTE_LIMIT = 5     # Agar koi bot lagatar 5 message feke toh direct MUTE
 SPAM_WINDOW = 5.0       # 2 seconds ka time window (Telegram lag ke liye perfect)
 
 # ============== CONFIGURATION ==============
-API_ID = "39807341"        # Add your API ID here for Pyrogram
-API_HASH = "4720383e9bad0dc95b20d1e6c365c5d7"    # Add your API Hash here for Pyrogram
-BOT_TOKEN = "8287080573:AAFVnLJuIs2mrszpiE58b_BVwKDwhRk6u88"
-ADMIN_IDS = [8531690745]
-BOT_START_TIME = time.time()
+import os
+import sys
 
-# Define OWNER_ID (first admin if any, else 0)
-OWNER_ID = int(os.environ.get("OWNER_ID", ADMIN_IDS[0] if ADMIN_IDS else 0))
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MONGO_URL = os.environ.get("MONGO_URL")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+if not all([API_ID, API_HASH, BOT_TOKEN, MONGO_URL]):
+    print("❌ Missing environment variables!")
+    sys.exit(1)
+    
 # Timezone setup for IST
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -91,9 +95,7 @@ logger = logging.getLogger(__name__)
 # 👇 ADD THIS LINE RIGHT HERE TO SILENCE PYROGRAM 👇
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-# --- AI SETUP START ---
-GEMINI_API_KEY = "AIzaSyDQ8tKK2YB66XljWPDjA7k8mZqYStjRK-k"
-genai.configure(api_key=GEMINI_API_KEY)
+# --- AI SETUP START --
 
 working_model = "gemini-1.5-flash" # Backup option
 try:
@@ -495,17 +497,16 @@ db = Database()
 
 
 # -------------------- DATABASE --------------------
-MONGO_URL = os.environ.get("MONGO_URL", "mongodb+srv://admin:Rishi9708697440@cluster0.pfafhkp.mongodb.net/?appName=Cluster0")
+
+from motor.motor_asyncio import AsyncIOMotorClient
+
 db_client = AsyncIOMotorClient(MONGO_URL)
 mongo_db = db_client["sticker_manager"]
 chats_col = mongo_db["chats"]
 stats_col = mongo_db["chat_stats"]
-
+gbans_col = mongo_db["gbans"]
 # (Database Helpers for Pyrogram remain completely identical as they do not rely on framework types)
 # ... [Keep your async database helper methods like is_locked, set_lock, etc. exactly as they were] ...
-
-# MongoDB collection for GBans
-gbans_col = mongo_db["gbans"]
 
 async def is_gbanned(user_id: int):
     # 1. Pehle cache check karein
