@@ -3593,32 +3593,70 @@ import os
 
 async def generate_welcome_image(client, user, chat_title):
 
-    bg = Image.open("welcome_bg.png").convert("RGBA")
+    assets_dir = Path(__file__).resolve().parent
+    bg = Image.open(assets_dir / "welcome_bg.png").convert("RGBA")
     draw = ImageDraw.Draw(bg)
 
-    font = ImageFont.load_default()
+    def load_font(size):
+        font_candidates = [
+            str(assets_dir / "fonts" / "Poppins-Bold.ttf"),
+            str(assets_dir / "fonts" / "Montserrat-Bold.ttf"),
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ]
+        for font_path in font_candidates:
+            if os.path.exists(font_path):
+                try:
+                    return ImageFont.truetype(font_path, size=size)
+                except OSError:
+                    continue
+        return ImageFont.load_default()
+
+    def draw_centered_text(text, box, size, fill="white"):
+        # Auto shrink text so long names/usernames fit in template box.
+        x1, y1, x2, y2 = box
+        text = (text or "-").strip() or "-"
+        font_size = size
+
+        while font_size >= 26:
+            font = load_font(font_size)
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            width, height = right - left, bottom - top
+            if width <= (x2 - x1):
+                x = x1 + ((x2 - x1) - width) // 2
+                y = y1 + ((y2 - y1) - height) // 2
+                draw.text((x, y), text, fill=fill, font=font)
+                return
+            font_size -= 2
+
+        draw.text((x1, y1), text, fill=fill, font=load_font(26))
 
     name = user.first_name
     user_id = str(user.id)
     username = f"@{user.username}" if user.username else "No Username"
     group = chat_title
 
-    # TEXT POSITIONS (template ke hisaab se)
-    draw.text((250, 430), name, fill="white", font=font)
-    draw.text((250, 540), user_id, fill="white", font=font)
-    draw.text((250, 650), username, fill="white", font=font)
-    draw.text((320, 760), group, fill="white", font=font)
+    # Match actual label rows in the background template.
+    draw_centered_text(name, (300, 330, 900, 370), 60)
+    draw_centered_text(user_id, (300, 410, 900, 475), 54)
+    draw_centered_text(username, (300, 490, 900, 580), 50)
+    draw_centered_text(group, (300, 550, 900, 685), 50)
 
     # USER PROFILE PHOTO
     photo = None
     async for p in client.get_chat_photos(user.id, limit=1):
         photo = await client.download_media(p.file_id)
 
-    if not photo:
-        photo = "default_pfp.png"
-
-    pfp = Image.open(photo).convert("RGBA").resize((420, 420))
-
+    if photo and os.path.exists(photo):
+        pfp = Image.open(photo).convert("RGBA").resize((420, 420))
+    else:
+        # Fallback avatar when user has no profile photo.
+        pfp = Image.new("RGBA", (420, 420), (75, 85, 99, 255))
+        fallback_draw = ImageDraw.Draw(pfp)
+        initial = (name or "?").strip()[:1].upper() or "?"
+        initial_font = load_font(180)
+        l, t, r, b = fallback_draw.textbbox((0, 0), initial, font=initial_font)
+        fallback_draw.text(((420 - (r - l)) // 2, (420 - (b - t)) // 2), initial, fill="white", font=initial_font)
+    
     # CIRCLE MASK
     mask = Image.new("L", (420, 420), 0)
     draw_mask = ImageDraw.Draw(mask)
@@ -3633,7 +3671,6 @@ async def generate_welcome_image(client, user, chat_title):
     bg.save(output)
 
     return output
-
 
 
 import asyncio
