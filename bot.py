@@ -3611,24 +3611,24 @@ async def generate_welcome_image(client, user, chat_title):
                     continue
         return ImageFont.load_default()
 
-    def draw_centered_text(text, box, size, fill="white"):
+    def draw_centered_text(text, box, size, fill="Red"):
         # Auto shrink text so long names/usernames fit in template box.
         x1, y1, x2, y2 = box
         text = (text or "-").strip() or "-"
         font_size = size
 
-        while font_size >= 26:
+        while font_size >= 42:
             font = load_font(font_size)
             left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
             width, height = right - left, bottom - top
             if width <= (x2 - x1):
                 x = x1 + ((x2 - x1) - width) // 2
                 y = y1 + ((y2 - y1) - height) // 2
-                draw.text((x, y), text, fill=fill, font=font)
+                draw.text((x, y), text, fill=fill, font=font, stroke_width=2, stroke_fill="black")
                 return
             font_size -= 2
 
-        draw.text((x1, y1), text, fill=fill, font=load_font(26))
+        draw.text((x1, y1), text, fill=fill, font=load_font(42), stroke_width=2, stroke_fill="black")
 
     name = user.first_name
     user_id = str(user.id)
@@ -3636,10 +3636,10 @@ async def generate_welcome_image(client, user, chat_title):
     group = chat_title
 
     # Match actual label rows in the background template.
-    draw_centered_text(name, (300, 330, 900, 370), 60)
-    draw_centered_text(user_id, (300, 410, 900, 475), 54)
-    draw_centered_text(username, (300, 490, 900, 580), 50)
-    draw_centered_text(group, (300, 550, 900, 685), 50)
+    draw_centered_text(name, (300, 320, 920, 390), 92)
+    draw_centered_text(user_id, (300, 400, 920, 490), 82)
+    draw_centered_text(username, (300, 485, 920, 595), 74)
+    draw_centered_text(group, (300, 545, 920, 700), 74)
 
     # USER PROFILE PHOTO
     photo = None
