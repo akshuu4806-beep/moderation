@@ -64,20 +64,18 @@ SPAM_DELETE_LIMIT = 2   # 2 messages safely honge, 3rd aate hi delete hoga
 SPAM_MUTE_LIMIT = 5     # Agar koi bot lagatar 5 message feke toh direct MUTE
 SPAM_WINDOW = 5.0       # 2 seconds ka time window (Telegram lag ke liye perfect)
 
-# ============== CONFIGURATION ==============
-import os
-import sys
-
+# ============== CONFIGURATION =============
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URL = os.environ.get("MONGO_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OWNER_ID = int(os.environ.get("OWNER_ID"))
 
 if not all([API_ID, API_HASH, BOT_TOKEN, MONGO_URL]):
     print("❌ Missing environment variables!")
     sys.exit(1)
-    
+
 # Timezone setup for IST
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -95,7 +93,9 @@ logger = logging.getLogger(__name__)
 # 👇 ADD THIS LINE RIGHT HERE TO SILENCE PYROGRAM 👇
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-# --- AI SETUP START --
+# --- AI SETUP START ---
+GEMINI_API_KEY = "AIzaSyDQ8tKK2YB66XljWPDjA7k8mZqYStjRK-k"
+genai.configure(api_key=GEMINI_API_KEY)
 
 working_model = "gemini-1.5-flash" # Backup option
 try:
@@ -497,16 +497,17 @@ db = Database()
 
 
 # -------------------- DATABASE --------------------
-
-from motor.motor_asyncio import AsyncIOMotorClient
-
+MONGO_URL = os.environ.get("MONGO_URL", "mongodb+srv://admin:Rishi9708697440@cluster0.pfafhkp.mongodb.net/?appName=Cluster0")
 db_client = AsyncIOMotorClient(MONGO_URL)
 mongo_db = db_client["sticker_manager"]
 chats_col = mongo_db["chats"]
 stats_col = mongo_db["chat_stats"]
-gbans_col = mongo_db["gbans"]
+
 # (Database Helpers for Pyrogram remain completely identical as they do not rely on framework types)
 # ... [Keep your async database helper methods like is_locked, set_lock, etc. exactly as they were] ...
+
+# MongoDB collection for GBans
+gbans_col = mongo_db["gbans"]
 
 async def is_gbanned(user_id: int):
     # 1. Pehle cache check karein
@@ -808,38 +809,78 @@ async def extract_target(client: Client, message: Message) -> tuple[int | None, 
     identifier = args[0]
     reason = " ".join(args[1:]) if len(args) > 1 else "No reason"
 
+    def _normalize_member_name(member_value):
+        """Supports legacy string format and future dict-based member records."""
+        if isinstance(member_value, dict):
+            return member_value.get("name") or member_value.get("first_name") or ""
+        return str(member_value or "")
+    
+    async def _resolve_from_identifier(raw_identifier: str):
+        """Resolve user from ID, @username, or bare username."""
+        # User ID
+        if raw_identifier.isdigit() or (raw_identifier.startswith('-') and raw_identifier[1:].isdigit()):
+            try:
+                user_id = int(raw_identifier)
+                chat_user = await client.get_users(user_id)
+                return user_id, chat_user.first_name or "User"
+            except Exception:
+                return None, None
+
+        # Username with or without @
+        candidate = raw_identifier if raw_identifier.startswith('@') else f"@{raw_identifier}"
+        if len(candidate) > 1:
+            try:
+                chat_user = await client.get_users(candidate)
+                return chat_user.id, chat_user.first_name or "User"
+            except Exception:
+                return None, None
+
+        return None, None
+
+
     # 2. Check for Text Mention (Entity)
-    if message.entities:
-        for entity in message.entities:
+    entities = message.entities or message.caption_entities
+    if entities:
+        for entity in entities:
             if entity.type == MessageEntityType.TEXT_MENTION:
                 return entity.user.id, entity.user.first_name, reason
+            if entity.type == MessageEntityType.MENTION and message.text:
+                entity_username = message.text[entity.offset: entity.offset + entity.length]
+                if entity_username:
+                    resolved_id, resolved_name = await _resolve_from_identifier(entity_username)
+                    if resolved_id:
+                        return resolved_id, resolved_name, reason
+    # 3. Check for User ID / @Username / bare username
+    resolved_id, resolved_name = await _resolve_from_identifier(identifier)
+    if resolved_id:
+        return resolved_id, resolved_name, reason
 
-    # 3. Check for User ID
-    if identifier.isdigit() or (identifier.startswith('-') and identifier[1:].isdigit()):
-        try:
-            user_id = int(identifier)
-            chat = await client.get_users(user_id)
-            return user_id, chat.first_name, reason
-        except Exception:
-            pass
-
-    # 4. Check for Username (@username)
-    if identifier.startswith('@'):
-        try:
-            chat = await client.get_users(identifier)
-            return chat.id, chat.first_name, reason
-        except Exception:
-            pass
-
-    # 5. Name Search (Agar Group Data/Memory me naam match ho jaye)
+    # 4. Name Search (Agar Group Data/Memory me naam match ho jaye)
     members = db.get_group_data(chat_id, 'members', {})
-    search_name = identifier.lower()
-    for str_uid, name in members.items():
-        if search_name == name.lower() or search_name in name.lower().split():
-            return int(str_uid), name, reason
+
+    # Multi-word names ko support karne ke liye longest prefix match
+    lowered_name_map = {
+        str_uid: _normalize_member_name(name).strip()
+        for str_uid, name in members.items()
+    }
+
+    for consume_count in range(len(args), 0, -1):
+        possible_name = " ".join(args[:consume_count]).strip().lower()
+        if not possible_name:
+            continue
+
+        for str_uid, display_name in lowered_name_map.items():
+            name_lower = display_name.lower()
+            if not name_lower:
+                continue
+
+            if possible_name == name_lower or possible_name in name_lower.split():
+                custom_reason = " ".join(args[consume_count:]) or "No reason"
+                return int(str_uid), display_name, custom_reason
 
     # Agar kuch bhi match nahi hua
     return None, None, "❌ User nahi mila. Kripya sahi ID, Username, ya Reply ka use karein."
+
 
 
 # ============== KEYBOARDS ==============
@@ -1680,24 +1721,32 @@ async def promote_command(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # Check if the user is the Group Owner or the Bot Owner
-    is_owner = False
-    if user_id == OWNER_ID:
-        is_owner = True
-    else:
-        try:
-            member = await client.get_chat_member(chat_id, user_id)
-            if member.status == enums.ChatMemberStatus.OWNER:
-                is_owner = True
-        except Exception:
-            pass
-            
-    if not is_owner:
-        await message.reply_text("🚫 Only the Group Owner can promote users.")
+    # Iss command ke liye sirf promote permission required hai
+    try:
+        actor_member = await client.get_chat_member(chat_id, user_id)
+        actor_has_promote_perm = (
+            actor_member.status == enums.ChatMemberStatus.OWNER or
+            (actor_member.status == enums.ChatMemberStatus.ADMINISTRATOR and actor_member.privileges and actor_member.privileges.can_promote_members)
+        )
+    except Exception:
+        actor_has_promote_perm = False
+
+    if not actor_has_promote_perm:
+        await message.reply_text("🚫 Aapke paas add admin (promote members) permission nahi hai.")
         return
         
-    if not await is_bot_admin(client, message):
-        await message.reply_text("🚫 I need to be an admin to promote users.")
+    try:
+        bot_id = (await client.get_me()).id
+        bot_member = await client.get_chat_member(chat_id, bot_id)
+        bot_has_promote_perm = (
+            bot_member.status == enums.ChatMemberStatus.OWNER or
+            (bot_member.status == enums.ChatMemberStatus.ADMINISTRATOR and bot_member.privileges and bot_member.privileges.can_promote_members)
+        )
+    except Exception:
+        bot_has_promote_perm = False
+
+    if not bot_has_promote_perm:
+        await message.reply_text("🚫 Mere paas add admin (promote members) permission nahi hai.")
         return
 
     target_id, target_name, custom_title = await extract_target(client, message)
@@ -1710,14 +1759,22 @@ async def promote_command(client: Client, message: Message):
     if title and len(title) > 16:
         title = title[:16]
 
+    # Promote with minimal required right so it works even when bot only has add-admin permission
+    # (can_promote_members). Unrelated permissions are intentionally kept disabled.
+
     try:
         await client.promote_chat_member(
             chat_id=chat_id,
             user_id=target_id,
             privileges=ChatPrivileges(
-                can_manage_chat=True, can_delete_messages=True, can_restrict_members=True,
-                can_promote_members=False, can_change_info=True, can_invite_users=True,
-                can_pin_messages=True, can_manage_video_chats=True
+                can_manage_chat=False,
+                can_delete_messages=False,
+                can_restrict_members=False,
+                can_promote_members=True,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False,
+                can_manage_video_chats=False
             )
         )
     except Exception as e:
@@ -1739,24 +1796,32 @@ async def demote_command(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # Check if the user is the Group Owner or the Bot Owner
-    is_owner = False
-    if user_id == OWNER_ID:
-        is_owner = True
-    else:
-        try:
-            member = await client.get_chat_member(chat_id, user_id)
-            if member.status == enums.ChatMemberStatus.OWNER:
-                is_owner = True
-        except Exception:
-            pass
-            
-    if not is_owner:
-        await message.reply_text("🚫 Only the Group Owner can demote users.")
+    # Iss command ke liye sirf promote permission required hai
+    try:
+        actor_member = await client.get_chat_member(chat_id, user_id)
+        actor_has_promote_perm = (
+            actor_member.status == enums.ChatMemberStatus.OWNER or
+            (actor_member.status == enums.ChatMemberStatus.ADMINISTRATOR and actor_member.privileges and actor_member.privileges.can_promote_members)
+        )
+    except Exception:
+        actor_has_promote_perm = False
+
+    if not actor_has_promote_perm:
+        await message.reply_text("🚫 Aapke paas add admin (promote members) permission nahi hai.")
         return
         
-    if not await is_bot_admin(client, message):
-        await message.reply_text("🚫 I need to be an admin to demote users.")
+    try:
+        bot_id = (await client.get_me()).id
+        bot_member = await client.get_chat_member(chat_id, bot_id)
+        bot_has_promote_perm = (
+            bot_member.status == enums.ChatMemberStatus.OWNER or
+            (bot_member.status == enums.ChatMemberStatus.ADMINISTRATOR and bot_member.privileges and bot_member.privileges.can_promote_members)
+        )
+    except Exception:
+        bot_has_promote_perm = False
+
+    if not bot_has_promote_perm:
+        await message.reply_text("🚫 Mere paas add admin (promote members) permission nahi hai.")
         return
 
     target_id, target_name, _ = await extract_target(client, message)
@@ -2401,60 +2466,6 @@ async def set_rules_command(client: Client, message: Message):
 
     await message.reply_text("✅ Rules have been updated!")
 
-async def warns_command(client: Client, message: Message):
-    chat_id = message.chat.id
-    args = message.command[1:] if len(message.command) > 1 else []
-
-    if message.reply_to_message or args:
-        target_id, target_name, _ = await extract_target(client, message)
-        if not target_id:
-            await message.reply_text("❗ Please reply to a user, or mention their User ID, Username, or Name.")
-            return
-    else:
-        target_id = message.from_user.id
-        target_name = message.from_user.first_name
-
-    safe_name = html.escape(target_name or "User")
-
-    # 👇 ADMIN CHECK 👇
-    try:
-        target_member = await client.get_chat_member(chat_id, target_id)
-        if target_member.status in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
-            await message.reply_text(f"🛡️ <b>{safe_name}</b> is an Admin. Admins do not have any warnings!", parse_mode=enums.ParseMode.HTML)
-            return
-    except Exception:
-        pass
-    # 👆 ADMIN CHECK 👆
-
-    warns = db.get_warns(target_id, chat_id)
-
-    is_muted = db.is_muted(target_id, chat_id)
-    status_text = "🔇 User is muted" if is_muted else "🟢 Active"
-
-    if not warns:
-        msg = (
-            f"<b>⚠️ Warnings for {safe_name}:</b>\n\n"
-            f"Total: 0/3\n"
-            f"Status: {status_text}"
-        )
-        await message.reply_text(msg, parse_mode=enums.ParseMode.HTML)
-        return
-
-    warn_text = f"<b>⚠️ Warnings for {safe_name}:</b>\n\n"
-    for i, warn in enumerate(warns, 1):
-        try:
-            warn_time = datetime.fromisoformat(warn['time']).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            warn_time = "Unknown time"
-
-        safe_reason = html.escape(warn['reason'])
-        warn_text += f"{i}. {safe_reason} ({warn_time})\n"
-
-    warn_text += f"\nTotal: {len(warns)}/3"
-    warn_text += f"\nStatus: {status_text}"
-
-    await message.reply_text(warn_text, parse_mode=enums.ParseMode.HTML)
-
 async def unban_command(client: Client, message: Message):
     if not await is_admin(client, message):
         await message.reply_text("🚫 You need to be an admin to use this command.")
@@ -2488,6 +2499,21 @@ async def warn_command(client: Client, message: Message):
         return
 
     chat_id = message.chat.id
+
+    # Warn tabhi chalega jab bot ke paas ban/restrict permission ho
+    try:
+        bot_id = (await client.get_me()).id
+        bot_member = await client.get_chat_member(chat_id, bot_id)
+        bot_has_ban_perm = (
+            bot_member.status == enums.ChatMemberStatus.OWNER or
+            (bot_member.status == enums.ChatMemberStatus.ADMINISTRATOR and bot_member.privileges and bot_member.privileges.can_restrict_members)
+        )
+    except Exception:
+        bot_has_ban_perm = False
+
+    if not bot_has_ban_perm:
+        await message.reply_text("🚫 I don't have ban permission.")
+        return
     target_id, target_name, reason = await extract_target(client, message)
 
     if not target_id:
@@ -2527,6 +2553,22 @@ async def warn_command(client: Client, message: Message):
     )
 
     if total_warns >= 3:
+        can_restrict_members = False
+        try:
+            bot_id = (await client.get_me()).id
+            bot_member = await client.get_chat_member(chat_id, bot_id)
+            can_restrict_members = (
+                bot_member.status == enums.ChatMemberStatus.OWNER or
+                (bot_member.status == enums.ChatMemberStatus.ADMINISTRATOR and bot_member.privileges and bot_member.privileges.can_restrict_members)
+            )
+        except Exception:
+            can_restrict_members = False
+
+        if not can_restrict_members:
+            db.reset_warns(target_id, chat_id)
+            await message.reply_text("i dont have member restricting right")
+            return
+
         try:
             await client.restrict_chat_member(
                 chat_id,
@@ -2542,7 +2584,9 @@ async def warn_command(client: Client, message: Message):
             )
 
         except Exception:
-            warning_msg += "\n\n⚠️ I could not mute the user. Check my admin permissions."
+            db.reset_warns(target_id, chat_id)
+            await message.reply_text("i dont have member restricting right")
+            return
 
     await message.reply_text(warning_msg, parse_mode=enums.ParseMode.HTML)
 
@@ -2552,6 +2596,21 @@ async def dwarn_command(client: Client, message: Message):
         return
 
     chat_id = message.chat.id
+
+    # Delete & Warn tabhi chalega jab bot ke paas ban/restrict permission ho
+    try:
+        bot_id = (await client.get_me()).id
+        bot_member = await client.get_chat_member(chat_id, bot_id)
+        bot_has_ban_perm = (
+            bot_member.status == enums.ChatMemberStatus.OWNER or
+            (bot_member.status == enums.ChatMemberStatus.ADMINISTRATOR and bot_member.privileges and bot_member.privileges.can_restrict_members)
+        )
+    except Exception:
+        bot_has_ban_perm = False
+
+    if not bot_has_ban_perm:
+        await message.reply_text("🚫 I don't have ban permission.")
+        return
     target_id, target_name, reason = await extract_target(client, message)
 
     if not target_id:
@@ -2594,6 +2653,22 @@ async def dwarn_command(client: Client, message: Message):
     )
 
     if total_warns >= 3:
+        can_restrict_members = False
+        try:
+            bot_id = (await client.get_me()).id
+            bot_member = await client.get_chat_member(chat_id, bot_id)
+            can_restrict_members = (
+                bot_member.status == enums.ChatMemberStatus.OWNER or
+                (bot_member.status == enums.ChatMemberStatus.ADMINISTRATOR and bot_member.privileges and bot_member.privileges.can_restrict_members)
+            )
+        except Exception:
+            can_restrict_members = False
+
+        if not can_restrict_members:
+            db.reset_warns(target_id, chat_id)
+            await message.reply_text("i dont have member restricting right")
+            return
+        
         try:
             await client.restrict_chat_member(
                 chat_id,
@@ -2608,7 +2683,9 @@ async def dwarn_command(client: Client, message: Message):
                 f"\nStatus: 🔇 User is muted"
             )
         except Exception:
-            warning_msg += "\n\n⚠️ I could not mute the user. Check my admin permissions."
+            db.reset_warns(target_id, chat_id)
+            await message.reply_text("i dont have member restricting right")
+            return
 
     await message.reply_text(warning_msg)
 
@@ -2722,26 +2799,28 @@ async def history_command(client: Client, message: Message):
     await send_typing_action(client, message)
 
     chat_id = message.chat.id
-    target_user = None
 
-    if message.reply_to_message:
-        target_user = message.reply_to_message.from_user
-    else:
-        target_user = message.from_user
+    # Use extract_target to get target user
+    target_id, target_name, error = await extract_target(client, message)
+
+    if not target_id:
+        # Fall back to sender if no target
+        target_id = message.from_user.id
+        target_name = message.from_user.first_name
 
     all_messages = []
     for msg in db.data['message_history'].get(chat_id, []):
-        if msg['user_id'] == target_user.id:
+        if msg['user_id'] == target_id:
             all_messages.append(msg)
 
     if not all_messages:
-        safe_name = html.escape(target_user.first_name or "User")
+        safe_name = html.escape(target_name or "User")
         await message.reply_text(f"{safe_name} has no recent message history in this chat.", parse_mode=enums.ParseMode.HTML)
         return
 
     recent_messages = all_messages[-10:]
 
-    safe_name = html.escape(target_user.first_name or "User")
+    safe_name = html.escape(target_name or "User")
     history_text = f"<b>📜 Message History for {safe_name}:</b>\n\n"
 
     for i, msg in enumerate(recent_messages, 1):
@@ -2933,7 +3012,7 @@ async def ban_command(client: Client, message: Message):
     try:
         target_member = await client.get_chat_member(chat_id, target_id)
         if target_member.status in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
-            await message.reply_text("what a hell i cannot kick or ban a admin")
+            await message.reply_text("🚫 I cannot take action against an admin.")
             return
     except Exception:
         pass
@@ -3100,21 +3179,45 @@ async def mute_command(client: Client, message: Message):
         pass
     # 👆 ADMIN PROTECTION CHECK 👆
 
-    duration = None
-    if args_text and args_text.split()[0].isdigit():
-        duration = int(args_text.split()[0])
+    duration_minutes = None
+    if args_text and args_text != "No reason":
+        first_token = args_text.split()[0].lower()
+        try:
+            if first_token.isdigit():
+                duration_minutes = int(first_token)
+            elif first_token.endswith('m') and first_token[:-1].isdigit():
+                duration_minutes = int(first_token[:-1])
+            elif first_token.endswith('h') and first_token[:-1].isdigit():
+                duration_minutes = int(first_token[:-1]) * 60
+            elif first_token.endswith('d') and first_token[:-1].isdigit():
+                duration_minutes = int(first_token[:-1]) * 1440
+        except Exception:
+            duration_minutes = None
 
-    mute_until = datetime.now() + timedelta(minutes=duration) if duration else None
+    mute_until = datetime.now(pytz.utc) + timedelta(minutes=duration_minutes) if duration_minutes else None
 
     try:
-        await client.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=target_id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=mute_until
-        )
+        restrict_kwargs = {
+            "chat_id": chat_id,
+            "user_id": target_id,
+            "permissions": ChatPermissions(can_send_messages=False)
+        }
+
+        # NOTE: Pass until_date only for timed mutes.
+        # Passing None can break on some Pyrogram/Telegram combinations
+        # with errors like: 'NoneType' object has no attribute 'to_bytes'.
+        if mute_until is not None:
+            restrict_kwargs["until_date"] = mute_until
+
+        await client.restrict_chat_member(**restrict_kwargs)
+
+        if duration_minutes:
+            db.mute_user(target_id, chat_id, mute_until)
+        else:
+            db.mute_user(target_id, chat_id, datetime.now(pytz.utc) + timedelta(days=3650))
+
         safe_name = html.escape(target_name or "User")
-        time_txt = f"for {duration} minutes" if duration else "permanently"
+        time_txt = f"for {duration_minutes} minutes" if duration_minutes else "permanently"
         await message.reply_text(f"🔇 {safe_name} has been muted {time_txt}.", parse_mode=enums.ParseMode.HTML)
     except Exception as e:
         await message.reply_text(f"Error: {e}")
@@ -3490,6 +3593,23 @@ import os
 
 async def generate_welcome_image(client, user, chat_title):
 
+    bg = Image.open("welcome_bg.png").convert("RGBA")
+    draw = ImageDraw.Draw(bg)
+
+    font = ImageFont.load_default()
+
+    name = user.first_name
+    user_id = str(user.id)
+    username = f"@{user.username}" if user.username else "No Username"
+    group = chat_title
+
+    # TEXT POSITIONS (template ke hisaab se)
+    draw.text((250, 430), name, fill="white", font=font)
+    draw.text((250, 540), user_id, fill="white", font=font)
+    draw.text((250, 650), username, fill="white", font=font)
+    draw.text((320, 760), group, fill="white", font=font)
+
+    # USER PROFILE PHOTO
     photo = None
     async for p in client.get_chat_photos(user.id, limit=1):
         photo = await client.download_media(p.file_id)
@@ -3497,39 +3617,24 @@ async def generate_welcome_image(client, user, chat_title):
     if not photo:
         photo = "default_pfp.png"
 
-    bg = Image.open("welcome_bg.png").convert("RGBA")
-    pfp = Image.open(photo).convert("RGBA").resize((300, 300))
+    pfp = Image.open(photo).convert("RGBA").resize((420, 420))
 
-    # Circle mask
-    mask = Image.new("L", (300, 300), 0)
+    # CIRCLE MASK
+    mask = Image.new("L", (420, 420), 0)
     draw_mask = ImageDraw.Draw(mask)
-    draw_mask.ellipse((0, 0, 300, 300), fill=255)
+    draw_mask.ellipse((0, 0, 420, 420), fill=255)
+
     pfp.putalpha(mask)
 
-    bg.paste(pfp, (880, 220), pfp)
-
-    draw = ImageDraw.Draw(bg)
-
-    # Safe default font (no arial dependency)
-    font_big = ImageFont.load_default()
-    font_small = ImageFont.load_default()
-
-    name = user.first_name or "User"
-    username = f"@{user.username}" if user.username else "No Username"
-
-    draw.text((100, 200), "WELCOME", fill=(0, 255, 255), font=font_big)
-    draw.text((100, 350), f"Name : {name}", fill="white", font=font_small)
-    draw.text((100, 420), f"ID : {user.id}", fill="white", font=font_small)
-    draw.text((100, 490), f"Username : {username}", fill="white", font=font_small)
-    draw.text((100, 560), f"Welcome to {chat_title}", fill="white", font=font_small)
+    # PROFILE POSITION (circle frame ke andar)
+    bg.paste(pfp, (980, 250), pfp)
 
     output = f"welcome_{user.id}.png"
     bg.save(output)
 
-    if photo != "default_pfp.png":
-        os.remove(photo)
-
     return output
+
+
 
 import asyncio
 from pyrogram import Client
@@ -3666,44 +3771,6 @@ async def filter_watcher(client: Client, message: Message):
                 print(f"Filter error: {e}")
 # ===========================================================
 
-async def anti_edit(client: Client, message: Message):
-    if message.chat.type.value not in ['group', 'supergroup']:
-        return
-    if not message.text and not message.caption and not getattr(message, 'media_group_id', None):
-        return
-
-    user = message.from_user
-    if not user:
-        return
-
-    user_display = f"@{user.username}" if user.username else user.first_name
-    user_link = f'<a href="tg://user?id={user.id}">{html.escape(user_display)}</a>'
-    
-    # Text nikalna aur HTML error se bachne ke liye usko escape karna
-    new_text = message.text or message.caption or "[Media]"
-    safe_text = html.escape(new_text[:150])
-    dots = "..." if len(new_text) > 150 else ""
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑️ OK / Delete", callback_data=f"del_msg|{user.id}")]
-    ])
-
-    await message.reply_text(
-        f"<b>❌ Edit Detected & Deleted</b>\n\n"
-        f"• <b>User:</b> {user_link}\n"
-        f"• <b>Action:</b> Attempted to edit message\n"
-        # Pyrogram me <spoiler> tag use hota hai
-        f"• <b>Edited Message:</b> <spoiler>{safe_text}{dots}</spoiler>\n\n"
-        f"<b>📌 Group Rule:</b> Editing is not allowed. Please send a new message instead.",
-        parse_mode=enums.ParseMode.HTML,
-        reply_markup=keyboard
-    )
-    
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
 async def handle_delete_callback(client: Client, callback_query: CallbackQuery):
     try:
         creator_id = int(callback_query.data.split("|")[1])
@@ -3733,27 +3800,6 @@ async def handle_delete_callback(client: Client, callback_query: CallbackQuery):
             "⚠️ Bhai, ye tere liye nahi hai! Sirf Admin ya owner hi delete kar sakte hain.",
             show_alert=True
         )
-
-async def anti_channel(client: Client, message: Message):
-    if not message.forward_from_chat:
-        return
-    if message.forward_from_chat.type == enums.ChatType.CHANNEL:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        if await is_approved(chat_id, user_id):
-            return
-            
-        try:
-            member = await client.get_chat_member(chat_id, user_id)
-            if member.status in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
-                return
-        except RPCError:
-            pass
-            
-        try:
-            await message.delete()
-        except Exception:
-            pass
 
 async def security_enforcer(client: Client, message: Message):
     # 👇 ADD THESE TWO LINES AT THE VERY TOP 👇
@@ -3947,10 +3993,8 @@ async def button_callback(client: Client, callback_query: CallbackQuery):
             "• <b>Ranking System:</b> Tracks daily, weekly, and overall active users.\n"
             "• <b>Tagging System:</b> Tag all admins (<code>/atag</code>) or everyone (<code>/utag</code>).\n"
             "• <b>Filter System:</b> Create and manage custom filters for your group.\n"
-            "• <b>Edit Montering:</b> Moniter and delete edited messages to security reason.\n" 
             "• <b>Bad Word Filter:</b> Automatically filter inappropriate words.\n"
             "• <b>Sticker Blocker:</b> Globally Block specific sticker packs.\n"
-            "• <b>Anti-Channel:</b> Automatically delete messages forwarded from channels bypass approved or admins.\n"
             "• <b>VC Monitor:</b> Notifies when users are invited to Voice Chats.\n\n"
         )
         await callback_query.edit_message_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=get_back_keyboard())
@@ -4453,7 +4497,7 @@ async def main_async():
     commands = {
         "start": start_command, "help": help_command, "menu": menu_command,
         "rules": rules_command, "setrules": set_rules_command, "warn": warn_command,
-        "warns": warns_command, "unwarn": unwarn_command, "ban": ban_command,
+        "unwarn": unwarn_command, "ban": ban_command,
         "unban": unban_command, "dban": dban_command, "dmute": dmute_command,
         "dkick": dkick_command, "dwarn": dwarn_command, "kick": kick_command,
         "mute": mute_command, "unmute": unmute_command, "pin": pin_command,
@@ -4494,11 +4538,6 @@ async def main_async():
     # 👇 YE DONO NAYI LINES YAHAN PASTE KAREIN 👇
     app.add_handler(MessageHandler(vc_start_handler, filters.video_chat_started), group=1)
     app.add_handler(MessageHandler(vc_end_handler, filters.video_chat_ended), group=1)
-
-    # ================= 🔧 GROUP 2: ANTI-EDIT & CHANNELS =================
-    # ✅ FIX: Changed to EditedMessageHandler so normal messages aren't deleted!
-    app.add_handler(EditedMessageHandler(anti_edit, filters.group), group=2) 
-    app.add_handler(MessageHandler(anti_channel, filters.forwarded & filters.group), group=2)
 
     # ================= 📈 GROUP 3: MESSAGE TRACKING =================
     app.add_handler(MessageHandler(message_tracker, filters.text & filters.group), group=3)
